@@ -292,3 +292,111 @@
     ERR-LOAN-NOT-FOUND
   )
 )
+
+;; Repay loan with flexible payment amounts
+(define-public (repay-loan
+    (loan-id uint)
+    (repay-amount uint)
+  )
+  (begin
+    (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (> repay-amount u0) ERR-INVALID-AMOUNT)
+    ;; Validate loan existence
+    (asserts! (<= loan-id (var-get loan-nonce)) ERR-INVALID-LOAN-ID)
+    (asserts! (is-some (get-loan-details loan-id)) ERR-LOAN-NOT-FOUND)
+    ;; Update interest before processing repayment
+    (try! (update-loan-interest loan-id))
+    (match (get-loan-details loan-id)
+      loan-data (let (
+          (borrower (get borrower loan-data))
+          (loan-amount (get loan-amount loan-data))
+          (interest (get interest-accumulated loan-data))
+          (collateral (get collateral-amount loan-data))
+          (total-owed (+ loan-amount interest))
+          (is-full-repayment (>= repay-amount total-owed))
+          (actual-repayment (if is-full-repayment
+            total-owed
+            repay-amount
+          ))
+          (remaining-loan (if is-full-repayment
+            u0
+            (- loan-amount
+              (if (>= actual-repayment interest)
+                (- actual-repayment interest)
+                u0
+              ))
+          ))
+          (remaining-interest (if is-full-repayment
+            u0
+            (if (>= actual-repayment interest)
+              u0
+              (- interest actual-repayment)
+            )
+          ))
+        )
+        ;; Verify borrower authorization
+        (asserts! (is-eq tx-sender borrower) ERR-NOT-AUTHORIZED)
+        ;; Transfer repayment to contract
+        (try! (stx-transfer? actual-repayment tx-sender (as-contract tx-sender)))
+        (if is-full-repayment
+          (begin
+            ;; Process full loan closure
+            (map-set loans { loan-id: loan-id }
+              (merge loan-data {
+                loan-amount: u0,
+                interest-accumulated: u0,
+                status: "repaid",
+              })
+            )
+            ;; Release collateral back to borrower
+            (map-set user-deposits borrower
+              (+ (get-user-deposit borrower) collateral)
+            )
+            ;; Update global borrowing statistics
+            (var-set total-borrowed (- (var-get total-borrowed) loan-amount))
+          )
+          (begin
+            ;; Process partial repayment
+            (map-set loans { loan-id: loan-id }
+              (merge loan-data {
+                loan-amount: remaining-loan,
+                interest-accumulated: remaining-interest,
+              })
+            )
+            ;; Update global borrowing statistics
+            (var-set total-borrowed
+              (- (var-get total-borrowed) (- loan-amount remaining-loan))
+            )
+          )
+        )
+        (ok actual-repayment)
+      )
+      ERR-LOAN-NOT-FOUND
+    )
+  )
+)
+
+;; Liquidate undercollateralized positions
+(define-public (liquidate (loan-id uint))
+  (begin
+    (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
+    ;; Validate loan existence
+    (asserts! (<= loan-id (var-get loan-nonce)) ERR-INVALID-LOAN-ID)
+    (asserts! (is-some (get-loan-details loan-id)) ERR-LOAN-NOT-FOUND)
+    ;; Update interest before liquidation
+    (try! (update-loan-interest loan-id))
+    ;; Verify liquidation eligibility
+    (asserts! (is-liquidatable loan-id) ERR-LOAN-NOT-LIQUIDATABLE)
+    (match (get-loan-details loan-id)
+      loan-data (let (
+          (borrower (get borrower loan-data))
+          (loan-amount (get loan-amount loan-data))
+          (interest (get interest-accumulated loan-data))
+          (collateral (get collateral-amount loan-data))
+          (total-debt (+ loan-amount interest))
+          (liquidation-bonus (/ (* collateral u5) u100))
+          (collateral-for-liquidator (- collateral liquidation-bonus))
+          (protocol-fee-from-liquidation (/ (* liquidation-bonus u50) u100))
+          (liquidator-bonus (- liquidation-bonus protocol-fee-from-liquidation))
+          (current-height (get-current-stacks-block-height))
+        )
