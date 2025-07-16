@@ -509,3 +509,15 @@
     protocol-fee: PROTOCOL-FEE-PERCENT,
   }
 )
+
+;; PROTOCOL INITIALIZATION
+
+(begin
+  ;; Initialize protocol state variables
+  (var-set loan-nonce u0)
+  (var-set total-collateral u0)
+  (var-set total-borrowed u0)
+  (var-set paused false)
+  ;; Initialize protocol fee tracking
+  (map-set protocol-fees (get-current-stacks-block-height) u0)
+)
