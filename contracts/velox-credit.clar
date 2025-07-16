@@ -213,3 +213,82 @@
     )
   )
 )
+
+;; Create new collateralized loan position
+(define-public (borrow
+    (collateral-amount uint)
+    (loan-amount uint)
+  )
+  (begin
+    (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (> collateral-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (> loan-amount u0) ERR-INVALID-AMOUNT)
+    (let (
+        (user-deposit (get-user-deposit tx-sender))
+        (collateral-value (* collateral-amount u1000))
+        (minimum-collateral-required (* loan-amount COLLATERAL-RATIO u10))
+        (loan-id (+ (var-get loan-nonce) u1))
+        (current-height (get-current-stacks-block-height))
+      )
+      ;; Validate collateral availability
+      (asserts! (>= user-deposit collateral-amount) ERR-INSUFFICIENT-BALANCE)
+      ;; Validate collateral ratio requirements
+      (asserts! (>= collateral-value minimum-collateral-required)
+        ERR-INSUFFICIENT-COLLATERAL
+      )
+      ;; Lock collateral in user's account
+      (map-set user-deposits tx-sender (- user-deposit collateral-amount))
+      ;; Create comprehensive loan record
+      (map-set loans { loan-id: loan-id } {
+        borrower: tx-sender,
+        collateral-amount: collateral-amount,
+        loan-amount: loan-amount,
+        interest-accumulated: u0,
+        creation-height: current-height,
+        last-interest-height: current-height,
+        status: "active",
+      })
+      ;; Update user's loan portfolio
+      (map-set user-loans tx-sender
+        (unwrap! (as-max-len? (append (get-user-loans tx-sender) loan-id) u20)
+          ERR-NOT-AUTHORIZED
+        ))
+      ;; Increment loan counter
+      (var-set loan-nonce loan-id)
+      ;; Update global borrowing statistics
+      (var-set total-borrowed (+ (var-get total-borrowed) loan-amount))
+      ;; Transfer loan proceeds to borrower
+      (try! (as-contract (stx-transfer? loan-amount (as-contract tx-sender) tx-sender)))
+      (ok loan-id)
+    )
+  )
+)
+
+;; Internal function to update loan interest accumulation
+(define-private (update-loan-interest (loan-id uint))
+  (match (get-loan-details loan-id)
+    loan-data (let (
+        (current-height (get-current-stacks-block-height))
+        (blocks-elapsed (- current-height (get last-interest-height loan-data)))
+        (loan-amount (get loan-amount loan-data))
+        (new-interest (calculate-interest loan-amount blocks-elapsed))
+        (current-interest (get interest-accumulated loan-data))
+        (updated-interest (+ current-interest new-interest))
+        (protocol-fee (/ (* new-interest PROTOCOL-FEE-PERCENT) u100))
+      )
+      ;; Update protocol fee accumulation
+      (map-set protocol-fees current-height
+        (+ (default-to u0 (map-get? protocol-fees current-height)) protocol-fee)
+      )
+      ;; Update loan with accumulated interest
+      (map-set loans { loan-id: loan-id }
+        (merge loan-data {
+          interest-accumulated: updated-interest,
+          last-interest-height: current-height,
+        })
+      )
+      (ok updated-interest)
+    )
+    ERR-LOAN-NOT-FOUND
+  )
+)
